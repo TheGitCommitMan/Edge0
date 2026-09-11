@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import queue
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -146,6 +147,48 @@ def _parse_anthropic_content(content):
     return str(content)
 
 
+def _is_session_title_request(payload: dict) -> bool:
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("query_source") == "generate_session_title":
+        return True
+    if payload.get("query_source") == "generate_session_title":
+        return True
+    for m in payload.get("messages", []):
+        content = m.get("content", "")
+        if isinstance(content, str):
+            c = content.lower()
+            if "generate a title" in c or "generate a short title" in c or "session title" in c:
+                return True
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    p = part.get("text", "").lower()
+                    if "generate a title" in p or "generate a short title" in p or "session title" in p:
+                        return True
+    return False
+
+
+def _fast_session_title(payload: dict) -> str:
+    for m in reversed(payload.get("messages", [])):
+        content = m.get("content", "")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text", "")
+                    break
+        words = [w.strip("`'\".,!?:;()") for w in text.split() if w.strip("`'\".,!?:;()")]
+        meaningful = [w for w in words if w.lower() not in (
+            "generate", "title", "summarize", "session", "user", "human", "assistant",
+            "a", "an", "the", "for", "please", "short", "very", "2-5", "words"
+        )]
+        if meaningful:
+            return " ".join(meaningful[:4]).title()
+    return "Edge0 Coding Session"
+
+
 def _anthropic_to_chat_request(payload: dict) -> ChatRequest:
     msgs = []
     sys_text = _parse_anthropic_system(payload.get("system"))
@@ -155,6 +198,10 @@ def _anthropic_to_chat_request(payload: dict) -> ChatRequest:
         role = str(m.get("role", "user"))
         content = _parse_anthropic_content(m.get("content", ""))
         msgs.append(ChatMessage(role=role, content=content))
+    thinking_req = payload.get("thinking")
+    enable_thinking = False
+    if isinstance(thinking_req, dict) and thinking_req.get("type") == "enabled":
+        enable_thinking = True
     return ChatRequest(
         model=str(payload.get("model", "")),
         messages=msgs,
@@ -162,12 +209,29 @@ def _anthropic_to_chat_request(payload: dict) -> ChatRequest:
         top_p=payload.get("top_p"),
         top_k=payload.get("top_k"),
         max_tokens=payload.get("max_tokens"),
+        enable_thinking=enable_thinking,
         stream=bool(payload.get("stream", False)),
         raw=payload,
     )
 
 
 def _anthropic_once(server: QueueServer, payload: dict):
+    if _is_session_title_request(payload):
+        title = _fast_session_title(payload)
+        return {
+            "id": f"msg_{int(time.time() * 1000)}",
+            "type": "message",
+            "role": "assistant",
+            "model": server.model_name,
+            "content": [{"type": "text", "text": title}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": len(title.split()),
+            },
+        }
+
     req = _anthropic_to_chat_request(payload)
     tokens, meta = server.chat(req)
     text = decode_tokens(server.engine, tokens)
@@ -195,6 +259,44 @@ def _anthropic_sse(event_type: str, data: dict) -> bytes:
 
 
 def _anthropic_stream(server: QueueServer, payload: dict):
+    if _is_session_title_request(payload):
+        title = _fast_session_title(payload)
+        msg_id = f"msg_{int(time.time() * 1000)}"
+        yield _anthropic_sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": server.model_name,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 1},
+            },
+        })
+        yield _anthropic_sse("content_block_start", {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        })
+        yield _anthropic_sse("content_block_delta", {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": title},
+        })
+        yield _anthropic_sse("content_block_stop", {
+            "type": "content_block_stop",
+            "index": 0,
+        })
+        yield _anthropic_sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": len(title.split())},
+        })
+        yield _anthropic_sse("message_stop", {"type": "message_stop"})
+        return
+
     req = _anthropic_to_chat_request(payload)
     events = queue.Queue()
     finished = object()
@@ -202,11 +304,12 @@ def _anthropic_stream(server: QueueServer, payload: dict):
 
     def on_token(tid: int):
         text = decode_tokens(server.engine, [tid])
-        events.put(_anthropic_sse("content_block_delta", {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": text},
-        }))
+        if text:
+            events.put(_anthropic_sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            }))
 
     def produce():
         try:
@@ -359,14 +462,24 @@ class _StdlibHandler(BaseHTTPRequestHandler):
     server_q = None  # type: QueueServer
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
     def _json(self, status: int, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _sse(self, events):
         self.send_response(200)
@@ -424,12 +537,15 @@ class _StdlibHandler(BaseHTTPRequestHandler):
         out = handlers[("POST " + path)](payload)
         if isinstance(out, tuple):
             body, status, headers = out
-            self.send_response(status)
-            for k, v in headers.items():
-                self.send_header(k, v)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         else:
             self._json(200, out)
 
@@ -441,6 +557,10 @@ def run_stdlib(server: QueueServer, host: str, port: int):
     handler = type("Edge0Handler", (_StdlibHandler,),
                    {"server_q": server})
     httpd = ThreadingHTTPServer((host, port), handler)
+    try:
+        httpd.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
     httpd.serve_forever()
 
 

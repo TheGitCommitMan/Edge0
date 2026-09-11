@@ -144,9 +144,9 @@ class Edge0Engine:
             # must carry the step return value — re-reading next_logits()
             # here would replay the prefill-final logits forever (the
             # greedy repetition bug: [353]*8 instead of [353, 2688, ...]).
-            logits = self.step(tid)
             if on_token is not None:
                 on_token(tid)
+            logits = self.step(tid)
         return out
 
     def reset(self):
