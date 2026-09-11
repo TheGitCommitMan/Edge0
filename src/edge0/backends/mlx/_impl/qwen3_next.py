@@ -17,7 +17,7 @@ from mlx_lm.models.base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, QuantizedKVCache
 from mlx_lm.models.gated_delta import gated_delta_update
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
@@ -460,7 +460,10 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
+        return [
+            ArraysCache(size=2) if l.is_linear else QuantizedKVCache(bits=4, group_size=64)
+            for l in self.layers
+        ]
 
     def sanitize(self, weights):
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:

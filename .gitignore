@@ -18,4 +18,8 @@ artifacts/
 
 # Bench / runtime logs
 *.log
+*.err
 scripts/alignment_results.json
+
+# Local downloaded models & weights
+models/

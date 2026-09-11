@@ -23,7 +23,7 @@ from mlx_lm.models.base import (
     create_attention_mask,
     create_ssm_mask,
 )
-from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, QuantizedKVCache
 from mlx_lm.models.gated_delta import gated_delta_update
 from edge0.backends.mlx._impl.qwen3_next import Qwen3NextAttention as Attention
 from edge0.backends.mlx._impl.qwen3_next import Qwen3NextMLP as MLP
@@ -330,7 +330,7 @@ class TextModel(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
+        return [ArraysCache(size=2) if l.is_linear else QuantizedKVCache(bits=4, group_size=64) for l in self.layers]
 
     def sanitize(self, weights):
         has_mtp_weights = any("mtp." in k for k in weights)

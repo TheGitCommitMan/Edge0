@@ -37,6 +37,29 @@ LoRA and prerouter training done for this framework — the adapter files
 are co-located with each checkpoint and load automatically, so
 `edge0 serve <tier>` runs the trained pipeline out of the box.
 
+## 🚀 1 Million Token Context Window & Claude Code Support
+
+This fork extends `edge0-35b` to a **1 Million Token Context Window (1,048,576 tokens)** and natively supports Anthropic Messages (`/v1/messages`) for seamless pairing with **Claude Code CLI** and autonomous agents on standard 8 GB unified memory devices:
+
+- **1M Context with YaRN RoPE**: Extended from 262k to 1M tokens via YaRN without degradation in local perplexity.
+- **Hybrid 4-Bit KV Cache Compression**: Exploits Edge0-35B's 30 recurrent linear attention layers ($O(1)$ constant memory) and 10 full attention layers (4-bit quantized KV cache) to keep 1M tokens at just **~1.25 GB KV cache** (~4.15 GB total system RAM).
+- **Native Claude Code Server**: Built-in `/v1/messages` streaming SSE handler inside Edge0—no external proxy bridges needed.
+- **Replication Guide**: Complete step-by-step instructions in [`docs/REPLICATION_1M_CONTEXT.md`](docs/REPLICATION_1M_CONTEXT.md).
+- **PII-Sanitized Agent Trajectory**: Full conversation transcript and debugging trace sanitized via OpenAI's Privacy Filter (`openai/privacy-filter`) in [`docs/AGENT_CONVERSATION_TRANSCRIPT_PII_STRIPPED.md`](docs/AGENT_CONVERSATION_TRANSCRIPT_PII_STRIPPED.md).
+
+Quick setup:
+```bash
+# Extend model config to 1M context
+python3 scripts/extend_context_1m.py models/edge0-35b
+
+# Configure Claude Code environment
+bash scripts/setup_claude_code.sh
+source ~/.bashrc
+
+# Start serving
+edge0 serve models/edge0-35b --port 8000
+```
+
 ## Requirements
 
 - **OS / hardware**: the MLX backend runs on macOS with Apple Silicon

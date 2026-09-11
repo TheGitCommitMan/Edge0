@@ -16,8 +16,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from edge0.server.chat import (QueueServer, parse_chat_request, sse_format,
-                               decode_tokens)
+from edge0.server.chat import (ChatMessage, ChatRequest, QueueServer,
+                               decode_tokens, parse_chat_request, sse_format)
 
 try:  # pragma: no cover - environment dependent
     from flask import Flask, Response, jsonify, request  # type: ignore
@@ -115,6 +115,150 @@ def _chat_stream(server: QueueServer, payload: dict):
         yield event
 
 
+def _parse_anthropic_system(sys_val):
+    if not sys_val:
+        return ""
+    if isinstance(sys_val, str):
+        return sys_val
+    if isinstance(sys_val, list):
+        return "\n".join(
+            p.get("text", "") for p in sys_val if isinstance(p, dict)
+        )
+    return str(sys_val)
+
+
+def _parse_anthropic_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                if p.get("type") == "text":
+                    parts.append(p.get("text", ""))
+                elif p.get("type") == "tool_use":
+                    parts.append(f"[tool_use: {p.get('name')}({json.dumps(p.get('input', {}))})]")
+                elif p.get("type") == "tool_result":
+                    parts.append(f"[tool_result: {p.get('content', '')}]")
+        return "\n".join(parts)
+    return str(content)
+
+
+def _anthropic_to_chat_request(payload: dict) -> ChatRequest:
+    msgs = []
+    sys_text = _parse_anthropic_system(payload.get("system"))
+    if sys_text:
+        msgs.append(ChatMessage(role="system", content=sys_text))
+    for m in payload.get("messages", []):
+        role = str(m.get("role", "user"))
+        content = _parse_anthropic_content(m.get("content", ""))
+        msgs.append(ChatMessage(role=role, content=content))
+    return ChatRequest(
+        model=str(payload.get("model", "")),
+        messages=msgs,
+        temperature=payload.get("temperature"),
+        top_p=payload.get("top_p"),
+        top_k=payload.get("top_k"),
+        max_tokens=payload.get("max_tokens"),
+        stream=bool(payload.get("stream", False)),
+        raw=payload,
+    )
+
+
+def _anthropic_once(server: QueueServer, payload: dict):
+    req = _anthropic_to_chat_request(payload)
+    tokens, meta = server.chat(req)
+    text = decode_tokens(server.engine, tokens)
+    think = bool(req.enable_thinking if req.enable_thinking is not None
+                 else getattr(server.engine, "think", False))
+    _, content = _split_think(text, think)
+    msg_id = f"msg_{int(time.time() * 1000)}"
+    return {
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "model": server.model_name,
+        "content": [{"type": "text", "text": content}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": meta["usage"]["prompt_tokens"],
+            "output_tokens": meta["usage"]["completion_tokens"],
+        },
+    }
+
+
+def _anthropic_sse(event_type: str, data: dict) -> bytes:
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _anthropic_stream(server: QueueServer, payload: dict):
+    req = _anthropic_to_chat_request(payload)
+    events = queue.Queue()
+    finished = object()
+    msg_id = f"msg_{int(time.time() * 1000)}"
+
+    def on_token(tid: int):
+        text = decode_tokens(server.engine, [tid])
+        events.put(_anthropic_sse("content_block_delta", {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        }))
+
+    def produce():
+        try:
+            events.put(_anthropic_sse("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": server.model_name,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            }))
+            events.put(_anthropic_sse("content_block_start", {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }))
+            _, meta = server.chat(req, on_token=on_token)
+            events.put(_anthropic_sse("content_block_stop", {
+                "type": "content_block_stop",
+                "index": 0,
+            }))
+            events.put(_anthropic_sse("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {
+                    "output_tokens": meta["usage"]["completion_tokens"],
+                },
+            }))
+            events.put(_anthropic_sse("message_stop", {
+                "type": "message_stop",
+            }))
+        except Exception as exc:
+            events.put(_anthropic_sse("error", {
+                "type": "error",
+                "error": {"type": "api_error", "message": str(exc)},
+            }))
+        finally:
+            events.put(finished)
+
+    threading.Thread(target=produce, daemon=True).start()
+    while True:
+        event = events.get()
+        if event is finished:
+            return
+        yield event
+
+
 def build_app_handlers(server: QueueServer):
     """Return a handler dispatch dict shared by both transports."""
 
@@ -132,6 +276,20 @@ def build_app_handlers(server: QueueServer):
             return _chat_stream(server, payload)
         return _chat_once(server, payload)
 
+    def handle_messages(payload: dict):
+        if payload.get("stream"):
+            if _HAS_FLASK:
+                return Response(
+                    _anthropic_stream(server, payload),
+                    mimetype="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            return _anthropic_stream(server, payload)
+        return _anthropic_once(server, payload)
+
     handlers = {
         "GET /healthz": lambda: {"status": "ok", "model": server.model_name},
         "GET /v1/models": lambda: {
@@ -143,6 +301,7 @@ def build_app_handlers(server: QueueServer):
             }],
         },
         "POST /v1/chat/completions": handle_chat,
+        "POST /v1/messages": handle_messages,
         "POST /v1/completions": lambda p: _error(
             400, "text completions not supported; use /v1/chat/completions"),
     }
@@ -175,6 +334,16 @@ def create_app(server: QueueServer):
             return out
         return jsonify(out)
 
+    @app.post("/v1/messages")
+    def messages():
+        payload = request.get_json(force=True, silent=True) or {}
+        out = handlers["POST /v1/messages"](payload)
+        if isinstance(out, Response):
+            return out
+        if isinstance(out, tuple) and out and isinstance(out[0], Response):
+            return out
+        return jsonify(out)
+
     @app.post("/v1/completions")
     def completions():
         payload = request.get_json(force=True, silent=True) or {}
@@ -193,6 +362,7 @@ class _StdlibHandler(BaseHTTPRequestHandler):
     def _json(self, status: int, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -200,6 +370,7 @@ class _StdlibHandler(BaseHTTPRequestHandler):
 
     def _sse(self, events):
         self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
@@ -219,6 +390,13 @@ class _StdlibHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def do_OPTIONS(self):  # noqa: N802
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
+
     def do_GET(self):  # noqa: N802
         path = urlparse(self.path).path
         handlers = build_app_handlers(self.server_q)
@@ -232,11 +410,14 @@ class _StdlibHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         path = urlparse(self.path).path
         handlers = build_app_handlers(self.server_q)
-        if path not in ("/v1/chat/completions", "/v1/completions"):
+        if path not in ("/v1/chat/completions", "/v1/completions", "/v1/messages"):
             self._json(404, {"error": {"message": f"no route {path}"}})
             return
         length = int(self.headers.get("Content-Length", 0))
         payload = json.loads(self.rfile.read(length) or b"{}")
+        if path == "/v1/messages" and payload.get("stream"):
+            self._sse(_anthropic_stream(self.server_q, payload))
+            return
         if path == "/v1/chat/completions" and payload.get("stream"):
             self._sse(_chat_stream(self.server_q, payload))
             return
